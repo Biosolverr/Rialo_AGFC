@@ -8,6 +8,8 @@ from pydantic import BaseModel
 from typing import List, Optional
 import hashlib
 import logging
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from agents.risk_agent import RiskAgent
 from agents.fraud_agent import FraudAgent
@@ -25,6 +27,12 @@ if os.path.exists(load_dotenv_path):
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Таймаут на каждый LLM-агент в секундах
+AGENT_TIMEOUT_SEC = int(os.getenv("AGENT_TIMEOUT_SEC", "30"))
+
+# Fallback-ответ если агент завис или упал
+AGENT_FALLBACK = {"score": 1.0, "approve": False, "flags": ["timeout"], "reasoning": "agent timeout"}
+
 app = FastAPI(
     title="Autonomous Treasury — Rialo Edition",
     description="Multi-agent financial governance system with Rialo Intelligent Contract layer",
@@ -38,6 +46,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Пул потоков для запуска синхронных агентов параллельно
+_executor = ThreadPoolExecutor(max_workers=3)
 
 
 class IntentRequest(BaseModel):
@@ -66,6 +77,29 @@ class IntentResponse(BaseModel):
     safe_tx: Optional[dict] = None
     tx_hash: Optional[str] = None
     rialo_mode: str = "simulation"
+
+
+def _run_agent(agent_cls, intent_data: dict) -> dict:
+    """Запускает агент синхронно — вызывается из ThreadPoolExecutor."""
+    try:
+        return agent_cls().evaluate(intent_data)
+    except Exception as e:
+        logger.warning(f"Agent {agent_cls.__name__} error: {e}")
+        return {**AGENT_FALLBACK, "reasoning": str(e)}
+
+
+async def _call_agent(agent_cls, intent_data: dict) -> dict:
+    """Запускает агент в отдельном потоке с таймаутом AGENT_TIMEOUT_SEC."""
+    loop = asyncio.get_event_loop()
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(_executor, _run_agent, agent_cls, intent_data),
+            timeout=AGENT_TIMEOUT_SEC,
+        )
+        return result
+    except asyncio.TimeoutError:
+        logger.warning(f"Agent {agent_cls.__name__} timed out after {AGENT_TIMEOUT_SEC}s")
+        return {**AGENT_FALLBACK, "reasoning": f"timeout after {AGENT_TIMEOUT_SEC}s"}
 
 
 @app.get("/")
@@ -103,9 +137,12 @@ async def process_intent(req: IntentRequest):
         "user_address": req.user_address,
     }
 
-    risk_result       = RiskAgent().evaluate(intent_data)
-    fraud_result      = FraudAgent().evaluate(intent_data)
-    compliance_result = ComplianceAgent().evaluate(intent_data)
+    # Все три агента запускаются параллельно с таймаутом — не висят вечно
+    risk_result, fraud_result, compliance_result = await asyncio.gather(
+        _call_agent(RiskAgent, intent_data),
+        _call_agent(FraudAgent, intent_data),
+        _call_agent(ComplianceAgent, intent_data),
+    )
 
     agent_decisions = [
         AgentDecision(

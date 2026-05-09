@@ -21,10 +21,9 @@ class TreasuryGovernance:
 
     def execute_transfer(self, recipient: str, amount: float, reason: str) -> dict:
         try:
-            # FIXED: always cast to int before any arithmetic to avoid float precision issues
-            amount_int = int(amount)
+            amount_int = int(amount)                  # always int, no float
             if self.client:
-                amount_wei = amount_int * 10 ** 18  # FIXED: int * int, no float
+                amount_wei = amount_int * 10 ** 18    # int * int, no float precision issues
                 tx = self.client.send_transaction(to=recipient, value=amount_wei, data=reason)
                 return {
                     "tx_hash": tx.hash if hasattr(tx, "hash") else f"0x{os.urandom(20).hex()}",

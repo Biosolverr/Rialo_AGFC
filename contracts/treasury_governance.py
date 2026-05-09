@@ -1,37 +1,21 @@
 # { "Depends": "py-genlayer:latest" }
-# ─────────────────────────────────────────────────────────────────────────────
-# TreasuryGovernance — Rialo Intelligent Contract
-#
-# This contract runs on the Rialo GenVM. It uses native webcall to call
-# the off-chain AI agent API (FastAPI on Railway) and records verdicts
-# on-chain. No oracle needed — Rialo handles the HTTP call natively.
-#
-# Deploy status: SIMULATION MODE
-#   - Contract logic is complete and tested locally.
-#   - Awaiting Rialo Devnet access to deploy.
-#   - To activate: set RIALO_RPC_URL in .env and run deploy script.
-#
-# Rialo docs: https://docs.rialo.io
-# ─────────────────────────────────────────────────────────────────────────────
-
-from genlayer import *  # Rialo uses genlayer-compatible runtime
+from genlayer import *
 import json
-
 
 AGENT_API_URL = "https://autonomous-financial-governance-system-agfs-production.up.railway.app"
 
 
 class TreasuryGovernance(gl.Contract):
     owner: gl.Address
-    amount_thresholds: gl.TreeMap[u256, u32]
-    verdict_log: gl.DynArray[str]
-    active_policies: gl.TreeMap[str, str]
+    amount_thresholds: gl.TreeMap
+    verdict_log: gl.DynArray
+    active_policies: gl.TreeMap
 
     def __init__(self, admin: gl.Address):
         self.owner = admin
-        self.amount_thresholds = gl.TreeMap[u256, u32]()
-        self.verdict_log = gl.DynArray[str]()
-        self.active_policies = gl.TreeMap[str, str]()
+        self.amount_thresholds = gl.TreeMap()
+        self.verdict_log = gl.DynArray()
+        self.active_policies = gl.TreeMap()
         self.amount_thresholds[1000] = 1
         self.amount_thresholds[10000] = 2
         self.amount_thresholds[999999999] = 3

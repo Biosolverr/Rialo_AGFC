@@ -9,7 +9,7 @@ from typing import List, Optional
 import hashlib
 import logging
 import asyncio
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor
 
 from agents.risk_agent import RiskAgent
 from agents.fraud_agent import FraudAgent
@@ -18,6 +18,7 @@ from consensus.engine import OptimisticConsensus
 from policy_engine.engine import PolicyEngine
 from safe_integration.executor import SafeExecutor
 from core.treasury_governance import TreasuryGovernance
+from core.genvm import compute_consensus_hash, sign_policy, GenVM
 
 load_dotenv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
 if os.path.exists(load_dotenv_path):
@@ -27,16 +28,13 @@ if os.path.exists(load_dotenv_path):
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Таймаут на каждый LLM-агент в секундах
 AGENT_TIMEOUT_SEC = int(os.getenv("AGENT_TIMEOUT_SEC", "30"))
-
-# Fallback-ответ если агент завис или упал
 AGENT_FALLBACK = {"score": 1.0, "approve": False, "flags": ["timeout"], "reasoning": "agent timeout"}
 
 app = FastAPI(
     title="Autonomous Treasury — Rialo Edition",
     description="Multi-agent financial governance system with Rialo Intelligent Contract layer",
-    version="2.0.0",
+    version="2.1.0",
 )
 
 app.add_middleware(
@@ -47,8 +45,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Пул потоков для запуска синхронных агентов параллельно
 _executor = ThreadPoolExecutor(max_workers=3)
+_genvm = GenVM()
 
 
 class IntentRequest(BaseModel):
@@ -73,14 +71,15 @@ class IntentResponse(BaseModel):
     reason: str
     agents: List[AgentDecision]
     consensus_confidence: float
+    consensus_hash: str          # deterministic reproducibility for Rialo
     policy: Optional[dict] = None
+    policy_signature: Optional[str] = None   # tamper-evident policy
     safe_tx: Optional[dict] = None
     tx_hash: Optional[str] = None
     rialo_mode: str = "simulation"
 
 
 def _run_agent(agent_cls, intent_data: dict) -> dict:
-    """Запускает агент синхронно — вызывается из ThreadPoolExecutor."""
     try:
         return agent_cls().evaluate(intent_data)
     except Exception as e:
@@ -89,14 +88,12 @@ def _run_agent(agent_cls, intent_data: dict) -> dict:
 
 
 async def _call_agent(agent_cls, intent_data: dict) -> dict:
-    """Запускает агент в отдельном потоке с таймаутом AGENT_TIMEOUT_SEC."""
     loop = asyncio.get_event_loop()
     try:
-        result = await asyncio.wait_for(
+        return await asyncio.wait_for(
             loop.run_in_executor(_executor, _run_agent, agent_cls, intent_data),
             timeout=AGENT_TIMEOUT_SEC,
         )
-        return result
     except asyncio.TimeoutError:
         logger.warning(f"Agent {agent_cls.__name__} timed out after {AGENT_TIMEOUT_SEC}s")
         return {**AGENT_FALLBACK, "reasoning": f"timeout after {AGENT_TIMEOUT_SEC}s"}
@@ -107,7 +104,7 @@ def root():
     rialo_connected = bool(os.getenv("RIALO_RPC_URL"))
     return {
         "name": "Autonomous Treasury — Rialo Edition",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "status": "running",
         "rialo_mode": "devnet" if rialo_connected else "simulation",
         "docs": "/docs",
@@ -123,6 +120,7 @@ def health():
         "consensus": "OptimisticConsensus (Rialo-compatible)",
         "rialo_node": "connected" if rialo_connected else "simulation",
         "contract": "contracts/treasury_governance.py",
+        "genvm": str(_genvm),
     }
 
 
@@ -137,7 +135,15 @@ async def process_intent(req: IntentRequest):
         "user_address": req.user_address,
     }
 
-    # Все три агента запускаются параллельно с таймаутом — не висят вечно
+    # Replay protection — hash the full intent
+    intent_hash = hashlib.sha256(
+        f"{req.user_address}{int(req.amount)}{req.recipient}{req.intent_text}".encode()
+    ).hexdigest()
+
+    if _genvm.replay.is_seen(intent_hash):
+        raise HTTPException(status_code=409, detail=f"Replay detected: intent already processed")
+
+    # Parallel agents with timeout
     risk_result, fraud_result, compliance_result = await asyncio.gather(
         _call_agent(RiskAgent, intent_data),
         _call_agent(FraudAgent, intent_data),
@@ -168,6 +174,12 @@ async def process_intent(req: IntentRequest):
         ),
     ]
 
+    # Deterministic consensus hash — reproducible across Rialo nodes
+    consensus_hash = compute_consensus_hash([
+        {"agent": d.agent, "approve": d.approve, "score": d.score}
+        for d in agent_decisions
+    ])
+
     votes = [d.approve for d in agent_decisions]
     avg_risk = sum(d.score for d in agent_decisions) / len(agent_decisions)
 
@@ -177,14 +189,17 @@ async def process_intent(req: IntentRequest):
 
     policy_engine = PolicyEngine()
     policy = policy_engine.generate(req.amount, avg_risk, consensus_result.margin)
+    policy_dict = policy.model_dump()
 
-    intent_hash = hashlib.sha256(
-        f"{req.user_address}{req.amount}{req.recipient}{req.intent_text}".encode()
-    ).hexdigest()
+    # Tamper-evident policy signature
+    policy_signature = sign_policy(policy_dict)
+
+    # Register intent as seen (replay protection)
+    _genvm.replay.check_and_register(intent_hash, nonce=0)
 
     safe_tx = None
     tx_hash = None
-    rialo_mode = "simulation"
+    rialo_mode = _genvm.mode
 
     voted_yes = sum(1 for v in votes if v)
     reason = (
@@ -203,9 +218,9 @@ async def process_intent(req: IntentRequest):
         tx_result = treasury.execute_transfer(req.recipient, req.amount, req.intent_text)
         rialo_mode = tx_result.get("mode", "simulation")
         reason += f" Safe TX built. Signers required: {policy.threshold}."
-        logger.info(f"TX approved: {tx_hash}, mode: {rialo_mode}")
+        logger.info(f"TX approved: {tx_hash}, consensus_hash: {consensus_hash}, mode: {rialo_mode}")
     else:
-        logger.info(f"TX rejected: {intent_hash}")
+        logger.info(f"TX rejected: {intent_hash}, consensus_hash: {consensus_hash}")
 
     return IntentResponse(
         status="approved" if approved else "rejected",
@@ -214,7 +229,9 @@ async def process_intent(req: IntentRequest):
         reason=reason,
         agents=agent_decisions,
         consensus_confidence=float(consensus_result.confidence),
-        policy=policy.model_dump(),
+        consensus_hash=consensus_hash,
+        policy=policy_dict,
+        policy_signature=policy_signature,
         safe_tx=safe_tx,
         tx_hash=tx_hash,
         rialo_mode=rialo_mode,
@@ -224,5 +241,5 @@ async def process_intent(req: IntentRequest):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
-    logger.info(f"Starting Autonomous Treasury (Rialo Edition) on port {port}")
+    logger.info(f"Starting Autonomous Treasury (Rialo Edition) v2.1.0 on port {port}")
     uvicorn.run("orchestrator.main:app", host="0.0.0.0", port=port, reload=False)

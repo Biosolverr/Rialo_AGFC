@@ -40,7 +40,7 @@ class TreasuryGovernance(gl.Contract):
     def evaluate_intent(self, intent_hash: str, amount: u256, recipient: str, description: str):
         payload = json.dumps({
             "user_address": str(self.owner),
-            "amount": float(amount),
+            "amount": int(amount),  # FIXED: int() required for GenVM ABI serialization
             "recipient": recipient,
             "intent_text": description,
         })
